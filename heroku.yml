@@ -1,5 +1,2 @@
-build:
-  docker:
-    web: docker run -d -p 9411:9411 openzipkin/zipkin
-  config:
-    RAILS_ENV: development
+run:
+  web: docker run -d -p 9411:9411 openzipkin/zipkin
