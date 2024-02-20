@@ -1,101 +1,93 @@
-# This builds a base JDK and JRE 11+ image that also includes a working shell
 #
-# You can choose to lint this via the following command:
-# docker run --rm -i hadolint/hadolint < Dockerfile
+# Copyright 2015-2024 The OpenZipkin Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+#
 
-# docker_parent_image is the base layer of full and jre image
+# java_version is used for install and runtime base layers of zipkin and zipkin-slim.
 #
-# Use latest version here: https://github.com/orgs/openzipkin/packages/container/package/alpine
-ARG docker_parent_image=ghcr.io/openzipkin/alpine:3.19.1
-
-# java_version and java_home are hard-coded here to allow the following:
-#  * `docker build https://github.com/openzipkin/docker-java.git`
-#
-# These are overridden via build-bin/docker/docker_args, ensuring the two are
-# coherent (e.g. java 21.* has a java_home of java-21-openjdk).
-#
-# When updating, also update the README
-#  * Use current version from https://pkgs.alpinelinux.org/packages?name=openjdk21, stripping
-#    the `-rX` at the end.
+# Use latest version here: https://github.com/orgs/openzipkin/packages/container/package/java
+# This is defined in many places because Docker has no "env" script functionality unless you use
+# docker-compose: When updating, update everywhere.
 ARG java_version=21.0.2_p13
-ARG java_home=/usr/lib/jvm/java-21-openjdk
 
 # We copy files from the context into a scratch container first to avoid a problem where docker and
 # docker-compose don't share layer hashes https://github.com/docker/compose/issues/883 normally.
 # COPY --from= works around the issue.
-FROM scratch as code
+FROM scratch as scratch
 
+COPY build-bin/docker/docker-healthcheck /docker-bin/
+COPY docker/start-zipkin /docker-bin/
 COPY . /code/
 
-FROM $docker_parent_image as base
+# This version is only used during the install process. Try to be consistent as it reduces layers,
+# which reduces downloads.
+FROM ghcr.io/openzipkin/java:${java_version} as install
 
-# java_version is hard-coded here to allow the following to work:
-#  * `docker build https://github.com/openzipkin/docker-java.git`
-#
-# When updating, also update the README
-#  * Use current version from https://pkgs.alpinelinux.org/packages?name=openjdk21
-# This is defined in many places because Docker has no "env" script functionality unless you use
-# docker-compose: When updating, update everywhere.
-ARG java_version
-ARG java_home
-LABEL java-version=$java_version
-LABEL java-home=$java_home
-
-ENV JAVA_VERSION=$java_version
-ENV JAVA_HOME=$java_home
-# Prefix Alpine Linux default path with ${JAVA_HOME}/bin
-ENV PATH=${JAVA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-WORKDIR /java
-
-ENTRYPOINT ["java", "-jar"]
-
-# The JDK image includes a few build utilities and Maven
-FROM base as jdk
-LABEL org.opencontainers.image.description="OpenJDK on Alpine Linux"
-ARG java_version
-ARG maven_version=3.9.6
-LABEL maven-version=$maven_version
-
-COPY --from=code /code/install.sh .
-RUN ./install.sh $java_version $maven_version && rm install.sh
-
-# Use a temporary target to build a JRE using the JDK we just built
-FROM jdk as install
+WORKDIR /code
+# Conditions aren't supported in Dockerfile instructions, so we copy source even if it isn't used.
+COPY --from=scratch /code/ .
 
 WORKDIR /install
 
-# Included modules cherry-picked from https://docs.oracle.com/en/java/javase/21/docs/api/
+# When true, build-bin/maven/unjar searches /code for the artifact instead of resolving remotely.
+# /code contains what is allowed in .dockerignore. On problem, ensure .dockerignore is correct.
+ARG release_from_maven_build=false
+ENV RELEASE_FROM_MAVEN_BUILD=$release_from_maven_build
+# Version of the artifact to unjar. Ex. "2.4.5" or "2.4.5-SNAPSHOT" "master" to use the pom version.
+ARG version=master
+ENV VERSION=$version
+ENV MAVEN_PROJECT_BASEDIR=/code
+RUN /code/build-bin/maven/maven_build_or_unjar io.zipkin zipkin-server ${VERSION} exec && \
+    mv zipkin-server zipkin && \
+    /code/build-bin/maven/maven_build_or_unjar io.zipkin zipkin-server ${VERSION} slim && \
+    mv zipkin-server zipkin-slim
+
+# Almost everything is common between the slim and normal build
+FROM ghcr.io/openzipkin/java:${java_version}-jre as base-server
+
+# All content including binaries and logs write under WORKDIR
+ARG USER=zipkin
+WORKDIR /${USER}
+
+# Ensure the process doesn't run as root
+RUN adduser -g '' -h ${PWD} -D ${USER}
+
+# Add HEALTHCHECK and ENTRYPOINT scripts into the default search path
+COPY --from=scratch /docker-bin/* /usr/local/bin/
+# We use start period of 30s to avoid marking the container unhealthy on slow or contended CI hosts.
 #
-# Note: Only include modules needed for the openzipkin/zipkin and
-# openzipkin/zipkin-slim images. It is fine for test images to use a full JRE.
-RUN jlink --vm=server --no-header-files --no-man-pages --compress=0 --strip-debug --add-modules \
-java.base,java.logging,\
-# java.desktop includes java.beans which is used by Spring
-java.desktop,\
-# our default server includes SQL
-java.sql,\
-# MariaDB Connector/J 3.x additionally requires rowset
-java.sql.rowset,\
-# instrumentation
-java.instrument,\
-# remote debug
-jdk.jdwp.agent,\
-# JVM metrics such as garbage collection
-jdk.management,\
-# TLS handshake with servers that use elliptic curve certificates
-jdk.crypto.ec,\
-# jdk.unsupported is undocumented but contains Unsafe, which is used by several dependencies to
-# improve performance. Ex. sun.misc.Unsafe and friends
-jdk.unsupported,\
-jdk.localedata --include-locales en \
---output jre
+# If in production, you have a 30s startup, please report to https://gitter.im/openzipkin/zipkin
+# including the values of the /health and /info endpoints as this would be unexpected.
+HEALTHCHECK --interval=5s --start-period=30s --timeout=5s CMD ["docker-healthcheck"]
 
-# Our JRE image is minimal: Only Alpine, gcompat and a stripped down JRE
-FROM base as jre
-LABEL org.opencontainers.image.description="Minimal OpenJDK JRE on Alpine Linux"
+ENTRYPOINT ["start-zipkin"]
 
-COPY --from=install /install/jre/ ${JAVA_HOME}/
+# Switch to the runtime user
+USER ${USER}
 
-# Typically, only amd64 is tested in CI: Run a command to ensure binaries match current arch.
-RUN java -version
+FROM base-server as zipkin-slim
+LABEL org.opencontainers.image.description="Zipkin slim distribution on OpenJDK and Alpine Linux"
+
+COPY --from=install --chown=${USER} /install/zipkin-slim/ /zipkin/
+
+EXPOSE 9411
+
+FROM base-server as zipkin
+LABEL org.opencontainers.image.description="Zipkin full distribution on OpenJDK and Alpine Linux"
+
+# 3rd party modules like zipkin-aws will apply profile settings with this
+ENV MODULE_OPTS=
+
+COPY --from=install --chown=${USER} /install/zipkin/ /zipkin/
+
+# Zipkin's full distribution includes Scribe support (albeit disabled)
+EXPOSE 9410 9411
